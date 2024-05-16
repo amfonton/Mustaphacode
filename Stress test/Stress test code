@@ -1,1 +1,459 @@
+# Bank stress test with FED scenario variables
+
+# I- Importing macroeconomic database from FRED MCCracken in quarterly basis 
+
+# Define URL paths where the data is stocked
+fred_qd_url <- "https://files.stlouisfed.org/files/htdocs/fred-md/quarterly/current.csv" 
+# Read  lines of data
+con <- url(fred_qd_url)
+lines <- readLines(con)
+close(con)
+
+# Remove the 2nd and 3rd lines which contain codes
+lines <- lines[-c(2,3)]
+
+# Convert the modified data back to a dataframe
+fred_qd_data <- read.csv(text = lines, stringsAsFactors = FALSE)
+View(fred_qd_data)
+
+# I-1 Subset desired series
+# I will keep only the following series : GDPC1 representing GDP, UNRATE, CPIAUCSL for consumer price index, TB3MS for treasury bonds of three month maturity, GS5 for treasury bond of 5 year maturity, GS10 for treasury bond of 10 year maturity, MORTGAGE30US for US mortgage rate, S&P 500 for US stock market index, USSTHPI for US house price index and VXICLSx for implied volatility index
+# These variables are chosen by the FED as the scenario variables in stress test.
+series_ids <- c("GDPC1", "UNRATE", "CPIAUCSL", "TB3MS", "GS5", "GS10", "MORTGAGE30US", "S.P.500", "USSTHPI", "VIXCLSx")
+selected_data <- fred_qd_data[, c("sasdate", series_ids)]
+
+# I-2 Transforming series to make them stationnary relatively to code defined in FRED Mcracke database
+fred_qd_mts <- ts(selected_data[,-1], start=c(1959, 1), frequency=4)  # First transform the data in time series object
+# List transformation code
+trans_codes <- list(
+  GDPC1 = "5",
+  UNRATE = "1",
+  CPIAUCSL = "5",
+  TB3MS = "1",
+  GS5 = "1",
+  GS10 = "1",
+  MORTGAGE30US = "1",
+  S.P.500 = "5",
+  USSTHPI = "5",
+  VIXCLSx = "1"
+)
+# Define transformation code
+library(zoo)
+library(dplyr)
+transform_series <- function(series, code) {
+  switch(code,
+         '1' = series, # No transformation
+         '2' = diff(series, differences = 1), # First difference
+         '3' = diff(series, differences = 2), # Second difference
+         '4' = log(series), # Natural log
+         '5' = diff(log(series), differences = 1)*100, # First difference of natural log
+         '6' = diff(log(series), differences = 2), # Second difference of natural log
+         series # Default is no transformation
+  )
+}
+
+# Apply the Transformation to each Series:
+
+fred_qd_mts_transformed <- fred_qd_mts  # Initialize the transformed object
+
+for (col_name in names(trans_codes)) {
+  code <- trans_codes[[col_name]]
+  col_index <- which(colnames(fred_qd_mts) == col_name)
+  
+  transformed_data <- transform_series(fred_qd_mts[, col_index], code)
+  
+  # Match the length of transformed data with the original mts object
+  if(length(transformed_data) < nrow(fred_qd_mts)) {
+    padding <- rep(NA, nrow(fred_qd_mts) - length(transformed_data))
+    transformed_data <- c(padding, transformed_data)
+  }
+  
+  fred_qd_mts_transformed[, col_index] <- transformed_data
+}
+
+
+View (fred_qd_mts_transformed)
+ 
+# I-3 Keeping only transformed data spanning 1986Q3-2021Q1 for stress test since bank data starts at 1986Q3
+start_time <- c(1986, 3)  # 1986Q3
+end_time <- c(2021, 1)   # 2021Q1
+
+# Extract the desired time span using the window function
+fred_qd_mts_subset <- window(fred_qd_mts_transformed, start=start_time, end=end_time)
+View (fred_qd_mts_subset)
+
+# I-4 Import macroeconomic scenarios and integrate it in the database
+library(readxl)# The macroeconomic scenarios are stocked in excel file
+scenario_data <- read_excel("C:/Users/Admin/Mustapha these/Chapter 2/Stress test/Database/Stess test scenarios.xlsx", sheet = "Forcing_variables")
+scenario_df <- as.data.frame(scenario_data)
+if ("Date" %in% colnames(scenario_df)) {
+  scenario_df$Date <- NULL
+} # I exclude column Date in a scenario data frame
+subset_df <- as.data.frame(fred_qd_mts_subset)# I convert fred_qd_mts_subset in dataframe
+start_row <- which(time(fred_qd_mts_subset) == 2019 + (0/4))
+end_row <- nrow(subset_df)  # select the start date and end date of macroeconomic scenarios
+
+for (i in start_row:end_row) {
+  subset_df[i, ] <- scenario_df[i - start_row + 1, ]
+}
+fred_qd_mts_updated_subset <- ts(subset_df, start = start(fred_qd_mts_subset), frequency = frequency(fred_qd_mts_subset))# updated macroeconomic database containing macroeconomic scenarios spanning 2019Q1-2021Q1
+
+
+# II- Importing bank specific data and merging it with macroeconomic series
+library(haven) ### The database on selected BHC has been processed in long format and is stocked in Stata fie
+
+# II-1 Convert macroeconomic series in dataframe and extracting date variable
+macro_df <- as.data.frame(fred_qd_mts_updated_subset)
+macro_df$date <- format(as.yearqtr(time(fred_qd_mts_updated_subset)), "%Y Q%q")
+View(macro_df)
+# II-2 Import bank variables
+bank_data <- read_dta("C:/Users/Admin/Mustapha these/Chapter 2/Stress test/bank_data.dta")
+bank_data$Date <- paste0(bank_data$year, "Q", bank_data$time) # I concatenate year and time to get data in YYYQ and transform it in quarter format of R
+bank_data$date <- as.yearqtr(bank_data$Date)
+View(bank_data)
+
+merged_data <- merge(bank_data, macro_df, by="date", all.x=TRUE)
+View(merged_data)
+# Arrange data relative to ID and date
+library(dplyr)
+sorted_data <- merged_data %>% 
+  arrange(ID, date)
+sorted_data <- sorted_data %>%
+  select( -Date_transf, -quarter) # I remove useless and redondant column
+
+# II-3 Computing bank-specific variables from raw data to be used in stress test
+# PPNR (Pre-Provision Net Revenue=((BHCK4074 + BHCK4079 - BHCK4093) / BHCK3368) * 100))
+sorted_data <- sorted_data %>%
+  mutate(PPNR = ((BHCK4074 + BHCK4079 - BHCK4093) / BHCK3368) * 100)
+
+# NCO (Net charge off=((BHCK4635- BHCK4605) / BHCK3368) * 100))
+sorted_data <- sorted_data %>%
+  mutate(NCO = ((BHCK4635- BHCK4605) / BHCK3368) * 100)
+
+# Compute lagged values of order 1 of PPNR and NCO 
+sorted_data <- sorted_data %>%
+  arrange(ID, date) %>%  # Ensure data is sorted by ID and date
+  group_by(ID) %>%      # Group by ID to compute lag within each group
+  mutate(PPNR_lag = lag(PPNR, 1),
+         NCO_lag = lag(NCO, 1)) %>%
+  ungroup()
+
+# Size 
+sorted_data <- sorted_data %>%
+  mutate(size = log(BHCK2170))
+
+# Consumer and Investment Loan volume (CILoan)
+sorted_data <- sorted_data %>%
+  mutate(CILoan = ((BHCK1763+ BHCK1764) / BHCK3368) * 100)
+
+# Real Estate Loan volume (RELoan)
+sorted_data <- sorted_data %>%
+  mutate(RELoan = (BHCK1410/ BHCK3368) * 100)
+
+# Lagged values of size, CILoan, REloan
+sorted_data <- sorted_data %>%
+  arrange(ID, date) %>%  # Ensure data is sorted by ID and date
+  group_by(ID) %>%      # Group by ID to compute lag within each group
+  mutate(size_lag = lag(size, 1),
+         CILoan_lag = lag(CILoan, 1), RELoan_lag = lag(RELoan, 1)) %>%
+  ungroup()
+
+# Lagged values of macroeconomic variables
+# Order the data by date
+sorted_data <- sorted_data %>%
+  arrange(date)
+
+# Now, compute the lagged values for the macroeconomic variables
+macroeconomic_variables <- c("GDPC1", "UNRATE", "CPIAUCSL", "TB3MS", "GS5", "GS10", "MORTGAGE30US", "S.P.500", "USSTHPI", "VIXCLSx")
+
+for(var in macroeconomic_variables){
+  lagged_name <- paste(var, "lag", sep="_")
+  sorted_data <- sorted_data %>%
+    mutate(!!lagged_name := lag(!!as.symbol(var), 1))
+}
+View(sorted_data)
+# II-4 Replacing some bank specific variables during stress period 2019q1-2012q1 by their values in 2018q4 (I assume as Covas et al. (2014) that since stress test exercise consists to analyse the capacity of the banks to face severely adverse condition while maintaining their capacity of intermediation that those variables should be set to their values before the stress test period)
+
+
+# List of bank variables to update
+# Copy of the original data
+data_updated <- sorted_data
+# List of bank variables to update
+bank_vars <- c("BHCK3163", "BHCK6442", "BHCK5610", "BHCK4336", "BHCK8427", "BHCK4460", "BHCKB704")
+
+# For each bank variable, replace values for 2019Q1 to 2021Q1 with values from 2018Q4
+for (var in bank_vars) {
+  
+  # Extract 2018Q4 values and IDs
+  values_2018Q4 <- subset(data_updated, date == "2018Q4", select = c("ID", var))
+  
+  # For each quarter from 2019Q1 to 2021Q1, replace with 2018Q4 values
+  for (qtr in c("2019Q1", "2019Q2", "2019Q3", "2019Q4", "2020Q1", "2020Q2", "2020Q3", "2020Q4", "2021Q1")) {
+    
+    # Identify the rows for the given quarter
+    rows_to_update <- which(data_updated$date == qtr)
+    
+    # Extract replacement values using a match for IDs
+    replacement_values <- values_2018Q4[[var]][match(data_updated$ID[rows_to_update], values_2018Q4$ID)]
+    
+    # Only replace values where the replacement is not NA
+    valid_replacements <- which(!is.na(replacement_values))
+    
+    # Update the values
+    data_updated[[var]][rows_to_update[valid_replacements]] <- replacement_values[valid_replacements]
+  }
+}
+
+
+View(values_2018Q4)
+View(data_updated)
+# Facultative step. Limit the data set to large selected BHCK regularly part of the FED sress test
+selected_BHCs <- c("1073757", "1951350","1039502","1199611", "1069778", "1111435", "1131787", "1120754", "1199844", "1078529", "1025608", "1068191", "1068025", "1070345")  
+filtered_data <- data_updated %>%
+  filter(ID %in% selected_BHCs)
+
+View(filtered_data)
+# III- Projecting PPNR and NCO under macroeconomic scenarios and relative to stated hypothesis
+# Loading libraries
+library(randomForest)
+library(glmnet)
+# III-1 Define predictors
+selected_predictors_nco <- c("NCO_lag", "CILoan_lag", "RELoan_lag", "size_lag","GDPC1","GDPC1_lag", "UNRATE", "UNRATE_lag", "CPIAUCSL", "CPIAUCSL_lag", "TB3MS", "TB3MS_lag", "GS10", "GS10_lag", "MORTGAGE30US","MORTGAGE30US_lag", "VIXCLSx","VIXCLSx_lag", "USSTHPI","USSTHPI_lag", "GS5","GS5_lag", "S.P.500", "S.P.500_lag"  )
+selected_predictors_ppnr <- c("PPNR_lag", "CILoan_lag", "RELoan_lag", "size_lag","GDPC1","GDPC1_lag", "UNRATE", "UNRATE_lag", "CPIAUCSL", "CPIAUCSL_lag", "TB3MS", "TB3MS_lag", "GS10", "GS10_lag", "MORTGAGE30US","MORTGAGE30US_lag", "VIXCLSx","VIXCLSx_lag", "USSTHPI","USSTHPI_lag", "GS5","GS5_lag", "S.P.500", "S.P.500_lag"  )
+
+# III-2 Split the data initially in two components. The first span 1986Q3-2018Q4 and the second is 2019Q1 first test sample
+train_data <- filtered_data %>% 
+  filter(date >= "1986Q3" & date <= "2018Q4") # initial train data
+
+test_data <- filtered_data %>% 
+  filter(date == "2019Q1")
+
+# III-3 NCO conditionnal prediction
+# initializing results for NCO
+# Initialize results_NCO with a column for Bank_ID
+results_NCO <- data.frame(Date=character(), Bank_ID=numeric(), Predicted_NCO=numeric()) 
+
+# Placeholder for the previous quarter's predictions
+previous_predictions <- NULL
+
+# Loop for NCO conditional prediction
+for(date in c("2019Q1", "2019Q2", "2019Q3", "2019Q4", "2020Q1", "2020Q2", "2020Q3", "2020Q4", "2021Q1")) {
+  
+  # If we have previous predictions and matching rows in train_data, update NCO_lag
+  if(!is.null(previous_predictions) && length(previous_predictions) > 0 && sum(train_data$date == date) == length(previous_predictions)) {
+    train_data$NCO_lag[train_data$date == date] <- previous_predictions
+  }
+  
+  # Subset the training data and omit rows with missing values only for the NCO predictors
+  nco_data <- train_data[complete.cases(train_data[, c("NCO", selected_predictors_nco)]), ]
+  
+  # Model Training for NCO using Random Forest
+  rf_formula_nco <- as.formula(paste("NCO ~", paste(selected_predictors_nco, collapse = " + ")))
+  rf_model_nco <- randomForest(rf_formula_nco, data = nco_data)
+  
+  # Prediction
+  test_data$predicted_NCO <- predict(rf_model_nco, test_data)
+  
+  # Store the results with Bank_ID
+  results_NCO <- rbind(results_NCO, data.frame(Date = test_data$date, Bank_ID = test_data$ID, Predicted_NCO = test_data$predicted_NCO))
+  
+  # Save the predictions for updating NCO_lag in the next iteration
+  previous_predictions <- test_data$predicted_NCO
+  
+  # Drop the predicted_NCO column from test_data
+  test_data$predicted_NCO <- NULL
+  
+  # Append the test data (for which we just predicted) to the training data
+  train_data <- rbind(train_data, test_data)
+  
+  # Update test_data for the next quarter
+  next_date <- as.yearqtr(date) + 1/4
+  test_data <- filtered_data %>% filter(date == as.character(next_date))
+}
+
+
+# Display the results
+# Sort the results by Bank_ID and Date
+sorted_results_NCO <- results_NCO %>%
+  arrange(Bank_ID, date)
+
+# Display the sorted results
+print(sorted_results_NCO)
+
+
+library(tidyverse)
+# III-4 PPNR conditional prediction
+
+# Ensure data is ordered chronologically
+filtered_data <- filtered_data %>%
+  arrange(date) 
+
+# Convert the date column to type 'yearqtr' if it isn't already
+if (!inherits(filtered_data$date, "yearqtr")) {
+  filtered_data$date <- as.yearqtr(filtered_data$date)
+}
+
+# Convert selected_predictors_ppnr into a formula string
+predictor_string <- paste(selected_predictors_ppnr, collapse = " + ")
+
+# Define the prediction quarters
+prediction_quarters <- c("2019Q1", "2019Q2", "2019Q3", "2019Q4", "2020Q1","2020Q2", "2020Q3", "2020Q4", "2021Q1" )
+
+# Create an empty data frame to store predictions
+prediction_df <- data.frame(Quarter = character(), Bank_ID = numeric(), Predicted_PPNR = numeric())
+
+for(quarter in prediction_quarters){
+  
+  # Split data into training and testing
+  train_data <- filtered_data %>% filter(date <= quarter)
+  
+  # Remove rows where the target or predictors have NA values
+  relevant_columns <- c("PPNR", "PPNR_lag", selected_predictors_ppnr)
+  train_data_cleaned <- train_data %>% drop_na(all_of(relevant_columns))
+  
+  # If after cleaning there's no data left, skip this iteration
+  if (nrow(train_data_cleaned) == 0) {
+    cat("All data for", quarter, "are NA. Skipping this iteration.\n")
+    next
+  }
+  
+  # Construct the formula dynamically
+  formula_string <- paste("PPNR ~", predictor_string, "+ PPNR_lag")
+  model_formula <- as.formula(formula_string)
+  
+  # Train the linear model using the dynamic formula
+  model <- lm(model_formula, data = train_data_cleaned)
+  
+  # Predict for the next quarter
+  test_data <- filtered_data %>% filter(date == quarter)
+  prediction_values <- predict(model, newdata = test_data)
+  
+  # Store predictions in the data frame
+  prediction_df <- rbind(prediction_df, data.frame(Quarter = rep(quarter, length(prediction_values)), Bank_ID = test_data$ID, Predicted_PPNR = prediction_values))
+  
+  # Update the lagged PPNR value for the next quarter using the individual predicted values
+  next_quarter_indices <- which(filtered_data$date == quarter)
+  update_indices <- next_quarter_indices + 1
+  update_indices <- update_indices[update_indices <= nrow(filtered_data)]
+  
+  for (idx in 1:length(update_indices)) {
+    bank_id <- filtered_data$ID[update_indices[idx]]
+    pred_value <- prediction_df$Predicted_PPNR[prediction_df$Bank_ID == bank_id & prediction_df$Quarter == quarter]
+    if (length(pred_value) > 0) {
+      filtered_data$PPNR_lag[update_indices[idx]] <- pred_value
+    }
+  }
+}
+
+# Display the prediction_df
+print(prediction_df)
+
+# Output predictions alongside their respective dates and bank IDs
+
+sorted_results <- prediction_df %>%
+  arrange(Quarter, Bank_ID)
+
+# Display the sorted results
+print(sorted_results)
+
+#III-5 Create new columns. I want to create two new columns in the dataset. One of the column deidcated to NCO contains the historical values of NCO till 2018Q4, and the predicted values from 2019Q1 to 2021Q1. The other column reports historical values of PPNR till 2018Q4 and the predicted values from 2019Q1 to 2021Q1.
+
+filtered_data$NCO_combined <- NA
+filtered_data$PPNR_combined <- NA
+
+#  Fill in the historical values up to 2018Q4
+filtered_data$NCO_combined[filtered_data$date <= "2018Q4"] <- filtered_data$NCO[filtered_data$date <= "2018Q4"]
+filtered_data$PPNR_combined[filtered_data$date <= "2018Q4"] <- filtered_data$PPNR[filtered_data$date <= "2018Q4"]
+
+# Fill in the predicted values from 2019Q1 to 2021Q1
+
+# For NCO
+for(date in unique(results_NCO$Date)) {
+  indices <- which(filtered_data$date == date)
+  filtered_data$NCO_combined[indices] <- results_NCO$Predicted_NCO[sorted_results_NCO$Date == date]
+}
+# For PPNR
+for(date in unique(sorted_results$Quarter)) {
+  indices <- which(filtered_data$date == date)
+  # Ensure we're referencing the correct column for predicted PPNR
+  filtered_data$PPNR_combined[indices] <- sorted_results$Predicted_PPNR[sorted_results$Quarter == date]
+}
+
+
+#III- Computing T1CR
+# T1CR is the ratio of regulatory capital to risk weighed asset.
+# Regulatory capital is the total equity capital corrected by regulatory adjustements called deductions.
+
+# Compute the total_deduction=Godwil(BHCK3163)+Intangible(BHCK6442)+Deferred(BHCK5610)+Cashflow(BHK4336)+Gain(BHCK8427)
+filtered_data$total_deduction <- filtered_data$BHCK3163 + filtered_data$BHCK6442 +  filtered_data$BHCK5610 + filtered_data$BHCK4336 + 
+  filtered_data$BHCK8427
+# Let us compute the value of NCO and PPNR
+filtered_data$NCO_value <- (filtered_data$NCO_combined * filtered_data$BHCK3368) / 100
+filtered_data$PPNR_value <- (filtered_data$PPNR_combined * filtered_data$BHCK3368) / 100
+
+# Project the equity capital for stress test period
+prediction_quarters <- c("2019Q1", "2019Q2", "2019Q3", "2019Q4", "2020Q1","2020Q2", "2020Q3", "2020Q4", "2021Q1" )
+# Extract the unique bank IDs
+bank_ids <- unique(filtered_data$ID)
+
+# Project the equity capital for each bank individually
+for (id in bank_ids) {
+  # Start with the equity capital value at 2018Q4 for the current bank
+  equity_capital_last <- filtered_data$BHCK3210[filtered_data$date == "2018Q4" & filtered_data$ID == id][1]
+  
+  for (quarter in prediction_quarters) {
+    # Get the relevant values for the current quarter and bank
+    ppnr_current <- filtered_data$PPNR_value[filtered_data$date == quarter & filtered_data$ID == id][1]
+    nco_current <- filtered_data$NCO_value[filtered_data$date == quarter & filtered_data$ID == id][1]
+    bhck4460_current <- filtered_data$BHCK4460[filtered_data$date == quarter & filtered_data$ID == id][1]
+    
+    # Project the equity capital value using the formula
+    equity_capital_next <- equity_capital_last + (ppnr_current - nco_current) * 0.79 - bhck4460_current
+    
+    # Update the equity capital value in the dataset for the current bank
+    filtered_data$BHCK3210[filtered_data$date == quarter & filtered_data$ID == id] <- equity_capital_next
+    
+    # Update equity_capital_last for the next iteration
+    equity_capital_last <- equity_capital_next
+  }
+}
+
+# Compute regulatory capital=Equity capital (BHCK3210)-total_deduction
+filtered_data$regulatory_capital <- ifelse(!is.na(filtered_data$BHCK3210) & is.na(filtered_data$total_deduction), 
+                                           filtered_data$BHCK3210, 
+                                           ifelse(!is.na(filtered_data$BHCK3210) & !is.na(filtered_data$total_deduction),
+                                                  filtered_data$BHCK3210 - filtered_data$total_deduction, NA)) # since there are many missing values for total_deduction denoted NA. This code allows to compute the difference if BHCK3210 and total_deduction are different from NA. However, if total_dedution is equal to NA, the difference results in BHCK3210.
+
+# Compute T1CR for historical and stress test period ;BHCKB704 is the risk-weighed asset
+filtered_data$T1CR <- (filtered_data$regulatory_capital / filtered_data$BHCKB704) * 100
+
+# Import bank names 
+bank_names <- read_dta("C:/Users/Admin/Mustapha these/Chapter 2/Stress test/bank_name.dta")
+
+# Join filtered_data with bank_names_df based on ID
+bank_names <- bank_names %>%
+  distinct(ID, .keep_all = TRUE)
+joined_data <- left_join(filtered_data, bank_names, by = "ID")
+View(joined_data)
+# Create the table with bank names
+T1CR_table_with_names <- joined_data %>%
+  filter(date >= "2018Q4" & date <= "2021Q1") %>%
+  select(all_of(c("ID", "Name", "Date", "T1CR")))
+
+View(T1CR_table_with_names)
+# Display the table
+print(T1CR_table_with_names)
+# Exporting table in latex
+library(xtable)
+
+latex_code <- xtable(T1CR_table_with_names)
+print(latex_code, type = "latex", floating = FALSE)
+
+capture.output(print(latex_code, type = "latex", floating = FALSE), file = "output.tex")
+# Display the subset data
+
+#  Saving joined_data dataframe in R
+save(joined_data, file = "joined_data.RData")
+
+
 
